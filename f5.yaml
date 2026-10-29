@@ -1,0 +1,245 @@
+# F5 BIG-IP practice lab: LTM / APM / ASM (Advanced WAF) backends
+#
+# Usage:
+#   docker compose up -d                          # core pool + vulnerable apps
+#   docker compose --profile iam up -d            # adds Keycloak, OpenLDAP, FreeRADIUS
+#   docker compose --profile extra up -d          # adds SSH, syslog, WebGoat
+#
+# Every service has a static IP on 172.28.0.0/24 AND a published host port, so
+# you can build pool members either way:
+#   - F5 on the same Docker host/network  -> use the 172.28.0.x IPs
+#   - F5 elsewhere (Proxmox VM, etc.)     -> use <docker-host-ip>:<published port>
+#   - For true L2 adjacency, swap the network to the macvlan block at the bottom.
+
+name: f5lab
+
+networks:
+  f5lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
+  # --- macvlan alternative (uncomment, set parent NIC/subnet, and drop ipv4_address collisions) ---
+  # f5lab:
+  #   driver: macvlan
+  #   driver_opts:
+  #     parent: eth0
+  #   ipam:
+  #     config:
+  #       - subnet: 192.168.50.0/24
+  #         gateway: 192.168.50.1
+  #         ip_range: 192.168.50.192/28
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # LTM: 3-node round robin / least conn / persistence / monitor practice
+  # Each node returns its own name at / and a 200 at /health.
+  # Break a node for monitor testing:  docker compose exec web2 rm /usr/share/nginx/html/health
+  # Cookie/source-addr persistence: reload / and watch which node answers.
+  # ---------------------------------------------------------------------------
+  web1:
+    image: nginx:alpine
+    hostname: web1
+    command: >
+      sh -c "echo '<h1>web1</h1><p>172.28.0.11</p>' > /usr/share/nginx/html/index.html &&
+             echo OK > /usr/share/nginx/html/health &&
+             nginx -g 'daemon off;'"
+    ports: ["8081:80"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.11 }
+
+  web2:
+    image: nginx:alpine
+    hostname: web2
+    command: >
+      sh -c "echo '<h1>web2</h1><p>172.28.0.12</p>' > /usr/share/nginx/html/index.html &&
+             echo OK > /usr/share/nginx/html/health &&
+             nginx -g 'daemon off;'"
+    ports: ["8082:80"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.12 }
+
+  web3:
+    image: nginx:alpine
+    hostname: web3
+    command: >
+      sh -c "echo '<h1>web3</h1><p>172.28.0.13</p>' > /usr/share/nginx/html/index.html &&
+             echo OK > /usr/share/nginx/html/health &&
+             nginx -g 'daemon off;'"
+    ports: ["8083:80"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.13 }
+
+  # Echoes request headers/cookies/IP. Great for validating X-Forwarded-For,
+  # iRules header inserts, APM session headers, and SSO header injection.
+  # Also: /status/503, /delay/5, /cookies/set?x=y, /basic-auth/user/pass
+  httpbin:
+    image: kennethreitz/httpbin
+    hostname: httpbin
+    ports: ["8090:80"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.20 }
+
+  # Echo server with WebSocket support at /.ws (test WebSocket profile / ASM WS support)
+  echo:
+    image: jmalloc/echo-server
+    hostname: echo
+    environment:
+      PORT: 8080
+    ports: ["8091:8080"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.21 }
+
+  # ---------------------------------------------------------------------------
+  # ASM / Advanced WAF: intentionally vulnerable apps
+  # Only ever expose these through the F5, never to the internet.
+  # ---------------------------------------------------------------------------
+  juiceshop:
+    image: bkimminich/juice-shop
+    hostname: juiceshop
+    ports: ["3000:3000"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.30 }
+
+  dvwa-db:
+    image: mariadb:10.11
+    hostname: dvwa-db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: dvwa
+      MYSQL_USER: dvwa
+      MYSQL_PASSWORD: p@ssw0rd
+    volumes:
+      - dvwa-db:/var/lib/mysql
+    networks:
+      f5lab: { ipv4_address: 172.28.0.31 }
+
+  # First run: browse to /setup.php and click "Create / Reset Database", login admin/password
+  dvwa:
+    image: ghcr.io/digininja/dvwa:latest
+    hostname: dvwa
+    depends_on: [dvwa-db]
+    environment:
+      DB_SERVER: dvwa-db
+      DB_DATABASE: dvwa
+      DB_USER: dvwa
+      DB_PASSWORD: p@ssw0rd
+    ports: ["8084:80"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.32 }
+
+  webgoat:
+    image: webgoat/webgoat
+    hostname: webgoat
+    profiles: ["extra"]
+    environment:
+      WEBGOAT_HOST: 0.0.0.0
+      WEBWOLF_HOST: 0.0.0.0
+    ports: ["8085:8080", "9090:9090"]   # WebGoat lives under /WebGoat
+    networks:
+      f5lab: { ipv4_address: 172.28.0.33 }
+
+  # ---------------------------------------------------------------------------
+  # APM: identity backends
+  # Keycloak  -> SAML IdP / OIDC provider (APM as SP or OAuth client/RS)
+  # OpenLDAP  -> LDAP AAA server (dc=lab,dc=local, admin: cn=admin,dc=lab,dc=local / adminpass)
+  # FreeRADIUS-> RADIUS AAA (default test user bob / test, secret testing123)
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    hostname: keycloak
+    profiles: ["iam"]
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: adminpass
+      KC_HTTP_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: xforwarded
+    ports: ["8180:8080"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.40 }
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    hostname: openldap
+    profiles: ["iam"]
+    environment:
+      LDAP_ORGANISATION: Lab
+      LDAP_DOMAIN: lab.local
+      LDAP_ADMIN_PASSWORD: adminpass
+      LDAP_TLS: "false"
+    volumes:
+      - ldap-data:/var/lib/ldap
+      - ldap-config:/etc/ldap/slapd.d
+    ports: ["389:389", "636:636"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.41 }
+
+  phpldapadmin:
+    image: osixia/phpldapadmin:latest
+    hostname: phpldapadmin
+    profiles: ["iam"]
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: openldap
+      PHPLDAPADMIN_HTTPS: "false"
+    ports: ["8181:80"]
+    depends_on: [openldap]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.42 }
+
+  # Default config allows clients in 172.16.0.0/12 with secret "testing123".
+  # If the F5 sits outside that range, add its self IP to a mounted clients.conf.
+  freeradius:
+    image: freeradius/freeradius-server:latest
+    hostname: freeradius
+    profiles: ["iam"]
+    ports: ["1812:1812/udp", "1813:1813/udp"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.43 }
+
+  # ---------------------------------------------------------------------------
+  # Extras: non-HTTP LB (TCP 22) and a remote syslog target for ASM/AFM logging
+  # SSH test user: lab / labpass   (ssh -p 2222 lab@<host>)
+  # Syslog: UDP 514 / TCP 601, logs land in ./syslog-logs
+  # ---------------------------------------------------------------------------
+  ssh1:
+    image: lscr.io/linuxserver/openssh-server:latest
+    hostname: ssh1
+    profiles: ["extra"]
+    environment:
+      USER_NAME: lab
+      USER_PASSWORD: labpass
+      PASSWORD_ACCESS: "true"
+    ports: ["2222:2222"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.50 }
+
+  ssh2:
+    image: lscr.io/linuxserver/openssh-server:latest
+    hostname: ssh2
+    profiles: ["extra"]
+    environment:
+      USER_NAME: lab
+      USER_PASSWORD: labpass
+      PASSWORD_ACCESS: "true"
+    ports: ["2223:2222"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.51 }
+
+  syslog:
+    image: lscr.io/linuxserver/syslog-ng:latest
+    hostname: syslog
+    profiles: ["extra"]
+    volumes:
+      - ./syslog-logs:/var/log
+    ports: ["514:5514/udp", "601:6601/tcp"]
+    networks:
+      f5lab: { ipv4_address: 172.28.0.52 }
+
+volumes:
+  dvwa-db:
+  ldap-data:
+  ldap-config:
